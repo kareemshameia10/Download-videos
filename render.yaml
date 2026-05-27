@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: mediagrab-api
+    runtime: node
+    rootDir: artifacts/api-server
+    buildCommand: pip install yt-dlp && npm install -g pnpm && pnpm install && pnpm run build
+    startCommand: pnpm run start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10000
+
+  - type: web
+    name: mediagrab-frontend
+    runtime: static
+    rootDir: artifacts/media-downloader
+    buildCommand: npm install -g pnpm && pnpm install && pnpm run build
+    staticPublishPath: dist
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
