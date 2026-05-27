@@ -1,5 +1,5 @@
 const express = require('express');
-const { exec, execSync } = require('child_process');
+const { exec, execSync, spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 const archiver = require('archiver');
@@ -10,58 +10,74 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const DOWNLOADS_DIR = path.join(__dirname, 'downloads');
 
-// Ensure downloads directory exists
 if (!fs.existsSync(DOWNLOADS_DIR)) fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
 
 app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Check yt-dlp is installed
-function checkYtDlp() {
-  try {
-    execSync('python3 -m yt_dlp --version', { stdio: 'pipe' });
-    return true;
-  } catch {
+// Detect yt-dlp binary once at startup
+let YT_DLP_BIN = null;
+function detectBin() {
+  const candidates = ['python3 -m yt_dlp', 'python -m yt_dlp', 'yt-dlp'];
+  for (const cmd of candidates) {
     try {
-      execSync('yt-dlp --version', { stdio: 'pipe' });
-      return true;
-    } catch {
-      return false;
-    }
+      execSync(`${cmd} --version`, { stdio: 'pipe', timeout: 10000 });
+      console.log(`✅ yt-dlp found: ${cmd}`);
+      return cmd;
+    } catch {}
   }
+  return null;
 }
 
-// Get the right yt-dlp command
-function ytdlpBin() {
-  try {
-    execSync('python3 -m yt_dlp --version', { stdio: 'pipe' });
-    return 'python3 -m yt_dlp';
-  } catch {
-    return 'yt-dlp';
-  }
-}
+YT_DLP_BIN = detectBin();
+console.log(`yt-dlp bin: ${YT_DLP_BIN || 'NOT FOUND'}`);
 
-// Get available formats for a URL
-app.post('/api/formats', async (req, res) => {
+// Get available formats
+app.post('/api/formats', (req, res) => {
   const { url } = req.body;
   if (!url) return res.status(400).json({ error: 'URL مطلوب' });
 
-  if (!checkYtDlp()) {
-    return res.status(500).json({ error: 'yt-dlp غير مثبت. شغّل: pip install yt-dlp' });
+  if (!YT_DLP_BIN) {
+    YT_DLP_BIN = detectBin();
+    if (!YT_DLP_BIN) return res.status(500).json({ error: 'yt-dlp غير مثبت على السيرفر' });
   }
 
-  const bin = ytdlpBin();
-  exec(`${bin} -J --no-playlist "${url}" 2>&1`, { timeout: 30000 }, (err, stdout, stderr) => {
-    if (err) {
-      return res.status(400).json({ error: 'تعذّر جلب معلومات الرابط. تأكد من صحة الرابط.' });
+  let stdoutData = '';
+  let stderrData = '';
+
+  // Use spawn to separate stdout and stderr properly
+  const args = ['-J', '--no-playlist', url];
+  let proc;
+
+  if (YT_DLP_BIN.includes('python')) {
+    const parts = YT_DLP_BIN.split(' ');
+    proc = spawn(parts[0], [...parts.slice(1), ...args]);
+  } else {
+    proc = spawn('yt-dlp', args);
+  }
+
+  const timer = setTimeout(() => {
+    proc.kill();
+    return res.status(400).json({ error: 'انتهى الوقت، الرابط بطيء أو غير صحيح' });
+  }, 30000);
+
+  proc.stdout.on('data', d => { stdoutData += d.toString(); });
+  proc.stderr.on('data', d => { stderrData += d.toString(); });
+
+  proc.on('close', (code) => {
+    clearTimeout(timer);
+    if (res.headersSent) return;
+
+    if (code !== 0) {
+      console.error('yt-dlp error:', stderrData);
+      return res.status(400).json({ error: stderrData || 'تعذّر جلب معلومات الرابط' });
     }
 
     try {
-      const info = JSON.parse(stdout);
+      const info = JSON.parse(stdoutData);
       const formats = [];
 
-      // Add combined formats (video+audio)
       if (info.formats) {
         const seen = new Set();
         info.formats
@@ -85,7 +101,6 @@ app.post('/api/formats', async (req, res) => {
           });
       }
 
-      // Add best presets
       const presets = [
         { format_id: 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best', ext: 'mp4', label: '🏆 أفضل جودة (MP4)', isPreset: true },
         { format_id: 'bestvideo[height<=1080]+bestaudio/best[height<=1080]', ext: 'mp4', label: '📺 1080p', isPreset: true },
@@ -104,7 +119,16 @@ app.post('/api/formats', async (req, res) => {
         formats: formats.slice(0, 30),
       });
     } catch (parseErr) {
-      res.status(400).json({ error: 'تعذّر قراءة معلومات الفيديو.' });
+      console.error('JSON parse error:', parseErr.message);
+      console.error('stdout was:', stdoutData.slice(0, 500));
+      res.status(400).json({ error: 'تعذّر قراءة بيانات الفيديو: ' + parseErr.message });
+    }
+  });
+
+  proc.on('error', (err) => {
+    clearTimeout(timer);
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'فشل تشغيل yt-dlp: ' + err.message });
     }
   });
 });
@@ -114,8 +138,9 @@ app.post('/api/download', (req, res) => {
   const { url, format_id, ext, audioOnly } = req.body;
   if (!url || !format_id) return res.status(400).json({ error: 'بيانات ناقصة' });
 
-  if (!checkYtDlp()) {
-    return res.status(500).json({ error: 'yt-dlp غير مثبت' });
+  if (!YT_DLP_BIN) {
+    YT_DLP_BIN = detectBin();
+    if (!YT_DLP_BIN) return res.status(500).json({ error: 'yt-dlp غير مثبت' });
   }
 
   const sessionId = uuidv4();
@@ -123,64 +148,61 @@ app.post('/api/download', (req, res) => {
   fs.mkdirSync(sessionDir, { recursive: true });
 
   const outputTemplate = path.join(sessionDir, '%(title)s.%(ext)s');
-  const bin = ytdlpBin();
 
-  let ytdlpCmd;
+  let args;
   if (audioOnly || ext === 'mp3') {
-    ytdlpCmd = `${bin} -f "${format_id}" --extract-audio --audio-format mp3 --audio-quality 0 -o "${outputTemplate}" "${url}"`;
+    args = ['-f', format_id, '--extract-audio', '--audio-format', 'mp3', '--audio-quality', '0', '-o', outputTemplate, url];
   } else {
-    ytdlpCmd = `${bin} -f "${format_id}" --merge-output-format mp4 -o "${outputTemplate}" "${url}"`;
+    args = ['-f', format_id, '--merge-output-format', 'mp4', '-o', outputTemplate, url];
   }
 
-  console.log(`[${sessionId}] Downloading: ${url}`);
-  console.log(`[${sessionId}] Command: ${ytdlpCmd}`);
-
-  // Send session ID immediately
   res.json({ sessionId, status: 'started' });
 
-  exec(ytdlpCmd, { timeout: 300000 }, (err, stdout, stderr) => {
-    if (err) {
-      console.error(`[${sessionId}] Error:`, stderr);
-      fs.writeFileSync(path.join(sessionDir, 'error.txt'), stderr || err.message);
+  let proc;
+  if (YT_DLP_BIN.includes('python')) {
+    const parts = YT_DLP_BIN.split(' ');
+    proc = spawn(parts[0], [...parts.slice(1), ...args]);
+  } else {
+    proc = spawn('yt-dlp', args);
+  }
+
+  let stderrData = '';
+  proc.stderr.on('data', d => { stderrData += d.toString(); });
+
+  proc.on('close', (code) => {
+    if (code !== 0) {
+      console.error(`[${sessionId}] Error:`, stderrData);
+      fs.writeFileSync(path.join(sessionDir, 'error.txt'), stderrData || 'خطأ غير معروف');
     } else {
       console.log(`[${sessionId}] Done!`);
       fs.writeFileSync(path.join(sessionDir, 'done.txt'), 'success');
     }
+  });
+
+  proc.on('error', (err) => {
+    fs.writeFileSync(path.join(sessionDir, 'error.txt'), err.message);
   });
 });
 
 // Check download status
 app.get('/api/status/:sessionId', (req, res) => {
   const sessionDir = path.join(DOWNLOADS_DIR, req.params.sessionId);
-
-  if (!fs.existsSync(sessionDir)) {
-    return res.json({ status: 'not_found' });
-  }
-
+  if (!fs.existsSync(sessionDir)) return res.json({ status: 'not_found' });
   if (fs.existsSync(path.join(sessionDir, 'error.txt'))) {
     const error = fs.readFileSync(path.join(sessionDir, 'error.txt'), 'utf8');
     return res.json({ status: 'error', error });
   }
-
-  if (fs.existsSync(path.join(sessionDir, 'done.txt'))) {
-    return res.json({ status: 'done' });
-  }
-
+  if (fs.existsSync(path.join(sessionDir, 'done.txt'))) return res.json({ status: 'done' });
   return res.json({ status: 'processing' });
 });
 
 // Create ZIP and download
 app.get('/api/zip/:sessionId', (req, res) => {
   const sessionDir = path.join(DOWNLOADS_DIR, req.params.sessionId);
-
-  if (!fs.existsSync(sessionDir)) {
-    return res.status(404).json({ error: 'الجلسة غير موجودة' });
-  }
+  if (!fs.existsSync(sessionDir)) return res.status(404).json({ error: 'الجلسة غير موجودة' });
 
   const files = fs.readdirSync(sessionDir).filter(f => !f.endsWith('.txt'));
-  if (files.length === 0) {
-    return res.status(404).json({ error: 'لا توجد ملفات للتحميل' });
-  }
+  if (files.length === 0) return res.status(404).json({ error: 'لا توجد ملفات للتحميل' });
 
   const zipName = `mediadown_${req.params.sessionId.slice(0, 8)}.zip`;
   res.setHeader('Content-Type', 'application/zip');
@@ -188,36 +210,26 @@ app.get('/api/zip/:sessionId', (req, res) => {
 
   const archive = archiver('zip', { zlib: { level: 6 } });
   archive.pipe(res);
-
-  files.forEach(file => {
-    archive.file(path.join(sessionDir, file), { name: file });
-  });
-
+  files.forEach(file => archive.file(path.join(sessionDir, file), { name: file }));
   archive.finalize();
 
-  // Cleanup after 10 minutes
-  setTimeout(() => {
-    fs.rmSync(sessionDir, { recursive: true, force: true });
-  }, 10 * 60 * 1000);
+  setTimeout(() => fs.rmSync(sessionDir, { recursive: true, force: true }), 10 * 60 * 1000);
 });
 
-// Cleanup old sessions (older than 1 hour)
+// Cleanup old sessions
 setInterval(() => {
   if (!fs.existsSync(DOWNLOADS_DIR)) return;
-  const sessions = fs.readdirSync(DOWNLOADS_DIR);
   const now = Date.now();
-  sessions.forEach(session => {
+  fs.readdirSync(DOWNLOADS_DIR).forEach(session => {
     const sessionDir = path.join(DOWNLOADS_DIR, session);
     try {
       const stat = fs.statSync(sessionDir);
-      if (now - stat.ctimeMs > 60 * 60 * 1000) {
-        fs.rmSync(sessionDir, { recursive: true, force: true });
-      }
+      if (now - stat.ctimeMs > 60 * 60 * 1000) fs.rmSync(sessionDir, { recursive: true, force: true });
     } catch {}
   });
 }, 15 * 60 * 1000);
 
 app.listen(PORT, () => {
   console.log(`\n🚀 MediaDown Server running at http://localhost:${PORT}`);
-  console.log(`📦 yt-dlp status: ${checkYtDlp() ? '✅ مثبت' : '❌ غير مثبت — شغّل: pip install yt-dlp'}\n`);
+  console.log(`📦 yt-dlp bin: ${YT_DLP_BIN || '❌ NOT FOUND'}\n`);
 });
