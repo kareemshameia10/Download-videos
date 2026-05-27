@@ -20,10 +20,25 @@ app.use(express.static(path.join(__dirname, 'public')));
 // Check yt-dlp is installed
 function checkYtDlp() {
   try {
-    execSync('yt-dlp --version', { stdio: 'pipe' });
+    execSync('python3 -m yt_dlp --version', { stdio: 'pipe' });
     return true;
   } catch {
-    return false;
+    try {
+      execSync('yt-dlp --version', { stdio: 'pipe' });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+}
+
+// Get the right yt-dlp command
+function ytdlpBin() {
+  try {
+    execSync('python3 -m yt_dlp --version', { stdio: 'pipe' });
+    return 'python3 -m yt_dlp';
+  } catch {
+    return 'yt-dlp';
   }
 }
 
@@ -36,7 +51,8 @@ app.post('/api/formats', async (req, res) => {
     return res.status(500).json({ error: 'yt-dlp غير مثبت. شغّل: pip install yt-dlp' });
   }
 
-  exec(`yt-dlp -J --no-playlist "${url}" 2>&1`, { timeout: 30000 }, (err, stdout, stderr) => {
+  const bin = ytdlpBin();
+  exec(`${bin} -J --no-playlist "${url}" 2>&1`, { timeout: 30000 }, (err, stdout, stderr) => {
     if (err) {
       return res.status(400).json({ error: 'تعذّر جلب معلومات الرابط. تأكد من صحة الرابط.' });
     }
@@ -107,12 +123,13 @@ app.post('/api/download', (req, res) => {
   fs.mkdirSync(sessionDir, { recursive: true });
 
   const outputTemplate = path.join(sessionDir, '%(title)s.%(ext)s');
+  const bin = ytdlpBin();
 
   let ytdlpCmd;
   if (audioOnly || ext === 'mp3') {
-    ytdlpCmd = `yt-dlp -f "${format_id}" --extract-audio --audio-format mp3 --audio-quality 0 -o "${outputTemplate}" "${url}"`;
+    ytdlpCmd = `${bin} -f "${format_id}" --extract-audio --audio-format mp3 --audio-quality 0 -o "${outputTemplate}" "${url}"`;
   } else {
-    ytdlpCmd = `yt-dlp -f "${format_id}" --merge-output-format mp4 -o "${outputTemplate}" "${url}"`;
+    ytdlpCmd = `${bin} -f "${format_id}" --merge-output-format mp4 -o "${outputTemplate}" "${url}"`;
   }
 
   console.log(`[${sessionId}] Downloading: ${url}`);
